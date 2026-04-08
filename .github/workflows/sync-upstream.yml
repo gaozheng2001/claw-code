@@ -55,7 +55,11 @@ jobs:
           git fetch upstream --prune
           git fetch origin --prune
 
-          git checkout "${MIRROR_BRANCH}"
+          if git show-ref --verify --quiet "refs/heads/${MIRROR_BRANCH}"; then
+            git checkout "${MIRROR_BRANCH}"
+          else
+            git checkout -b "${MIRROR_BRANCH}" "origin/${MIRROR_BRANCH}"
+          fi
           git merge --ff-only "upstream/${MIRROR_BRANCH}"
           git push origin "${MIRROR_BRANCH}"
 

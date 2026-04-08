@@ -107,7 +107,15 @@ end
 
 run_or_fail git fetch $upstream_remote --prune
 
-run_or_fail git checkout $mirror_branch
+if git show-ref --verify --quiet refs/heads/$mirror_branch
+    run_or_fail git checkout $mirror_branch
+else if git ls-remote --exit-code --heads $origin_remote $mirror_branch >/dev/null 2>&1
+    run_or_fail git checkout -b $mirror_branch "$origin_remote/$mirror_branch"
+else
+    echo "Mirror branch '$mirror_branch' not found on remote '$origin_remote'." >&2
+    restore_context
+    exit 1
+end
 run_or_fail git merge --ff-only "$upstream_remote/$mirror_branch"
 run_or_fail git push $origin_remote $mirror_branch
 
