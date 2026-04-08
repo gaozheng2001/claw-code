@@ -171,3 +171,6 @@ if test $SYNC_STASHED -eq 1
 end
 
 echo "DONE: synced $mirror_branch and refreshed $work_branch"
+
+cd rust
+cargo build --workspace
