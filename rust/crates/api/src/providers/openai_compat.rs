@@ -94,13 +94,19 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
-        };
-        Ok(Self::new(api_key, config))
+        if let Some(api_key) = read_env_non_empty(config.api_key_env)? {
+            return Ok(Self::new(api_key, config));
+        }
+
+        let base_url = read_base_url(config);
+        if allows_missing_api_key_for_base_url(config, &base_url) {
+            return Ok(Self::new("ollama", config).with_base_url(base_url));
+        }
+
+        Err(ApiError::missing_credentials(
+            config.provider_name,
+            config.credential_env_vars(),
+        ))
     }
 
     #[must_use]
@@ -225,6 +231,26 @@ impl OpenAiCompatClient {
         let base = self.backoff_for_attempt(attempt)?;
         Ok(base + jitter_for_base(base))
     }
+}
+
+fn allows_missing_api_key_for_base_url(config: OpenAiCompatConfig, base_url: &str) -> bool {
+    if config != OpenAiCompatConfig::openai() {
+        return false;
+    }
+
+    let Ok(parsed) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+
+    parsed
+        .host_str()
+        .map(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host == "127.0.0.1"
+                || host == "::1"
+                || host == "0.0.0.0"
+        })
+        .unwrap_or(false)
 }
 
 /// Process-wide counter that guarantees distinct jitter samples even when
@@ -697,7 +723,22 @@ fn is_reasoning_model(model: &str) -> bool {
         || lowered == "grok-3-mini"
 }
 
+fn normalize_model_for_provider(model: &str, config: OpenAiCompatConfig) -> String {
+    let trimmed = model.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    match config.provider_name {
+        "OpenAI" if lowered.starts_with("openai/") => trimmed
+            .split_once('/')
+            .map_or_else(|| trimmed.to_string(), |(_, name)| name.to_string()),
+        "xAI" if lowered.starts_with("xai/") => trimmed
+            .split_once('/')
+            .map_or_else(|| trimmed.to_string(), |(_, name)| name.to_string()),
+        _ => trimmed.to_string(),
+    }
+}
+
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    let model = normalize_model_for_provider(&request.model, config);
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -710,7 +751,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     let mut payload = json!({
-        "model": request.model,
+        "model": model,
         "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
@@ -731,7 +772,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     // OpenAI-compatible tuning parameters — only included when explicitly set.
     // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
     // silently strip them to avoid cryptic provider errors.
-    if !is_reasoning_model(&request.model) {
+    if !is_reasoning_model(&model) {
         if let Some(temperature) = request.temperature {
             payload["temperature"] = json!(temperature);
         }
@@ -1040,9 +1081,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        allows_missing_api_key_for_base_url, build_chat_completion_request,
+        chat_completions_endpoint, is_reasoning_model, normalize_finish_reason,
+        normalize_model_for_provider, openai_tool_choice, parse_tool_arguments,
+        OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1167,6 +1209,65 @@ mod tests {
     }
 
     #[test]
+    fn loopback_openai_base_url_allows_missing_api_key() {
+        let _lock = env_lock();
+        let original_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let result = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai());
+
+        if let Some(value) = original_base_url {
+            std::env::set_var("OPENAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("OPENAI_BASE_URL");
+        }
+        if let Some(value) = original_api_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        } else {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        assert!(result.is_ok(), "loopback openai endpoint should accept missing key");
+    }
+
+    #[test]
+    fn remote_openai_base_url_requires_api_key() {
+        let _lock = env_lock();
+        let original_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        std::env::set_var("OPENAI_BASE_URL", "https://api.openai.com/v1");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let result = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai());
+
+        if let Some(value) = original_base_url {
+            std::env::set_var("OPENAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("OPENAI_BASE_URL");
+        }
+        if let Some(value) = original_api_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        } else {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        assert!(
+            matches!(
+                result,
+                Err(ApiError::MissingCredentials {
+                    provider: "OpenAI",
+                    ..
+                })
+            ),
+            "remote openai endpoint should still require API key"
+        );
+    }
+
+    #[test]
     fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1"),
@@ -1179,6 +1280,50 @@ mod tests {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn missing_api_key_allowance_is_limited_to_loopback_openai() {
+        assert!(allows_missing_api_key_for_base_url(
+            OpenAiCompatConfig::openai(),
+            "http://localhost:11434/v1"
+        ));
+        assert!(!allows_missing_api_key_for_base_url(
+            OpenAiCompatConfig::openai(),
+            "https://api.openai.com/v1"
+        ));
+        assert!(!allows_missing_api_key_for_base_url(
+            OpenAiCompatConfig::xai(),
+            "http://127.0.0.1:11434/v1"
+        ));
+    }
+
+    #[test]
+    fn strips_openai_namespace_for_openai_provider() {
+        assert_eq!(
+            normalize_model_for_provider("openai/gemma4:31b", OpenAiCompatConfig::openai()),
+            "gemma4:31b"
+        );
+        assert_eq!(
+            normalize_model_for_provider("openai/gpt-4o-mini", OpenAiCompatConfig::openai()),
+            "gpt-4o-mini"
+        );
+    }
+
+    #[test]
+    fn strips_xai_namespace_for_xai_provider() {
+        assert_eq!(
+            normalize_model_for_provider("xai/grok-3", OpenAiCompatConfig::xai()),
+            "grok-3"
+        );
+    }
+
+    #[test]
+    fn keeps_plain_model_name_unchanged() {
+        assert_eq!(
+            normalize_model_for_provider("gpt-4o", OpenAiCompatConfig::openai()),
+            "gpt-4o"
         );
     }
 

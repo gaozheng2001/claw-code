@@ -202,8 +202,10 @@ Local project settings override user-level settings. Aliases resolve through the
 
 1. If the resolved model name starts with `claude` → Anthropic.
 2. If it starts with `grok` → xAI.
-3. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
-4. If nothing matches, it defaults to Anthropic.
+3. Otherwise, if `OPENAI_BASE_URL` is set, route to the OpenAI-compatible provider.
+4. Otherwise, if `XAI_BASE_URL` is set, route to xAI.
+5. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
+6. If nothing matches, it defaults to Anthropic.
 
 ## FAQ
 
