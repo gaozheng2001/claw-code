@@ -7,6 +7,7 @@ set -l origin_remote origin
 set -l mirror_branch main
 set -l work_branch my-main
 set -l feature_branch ""
+set -l prefer_upstream 0
 
 set -g SYNC_ORIGINAL_BRANCH ""
 set -g SYNC_STASHED 0
@@ -21,6 +22,7 @@ function usage
     echo "  --mirror-branch <branch>    Branch mirrored from upstream (default: main)"
     echo "  --work-branch <branch>      Branch carrying local fixes (default: my-main)"
     echo "  --feature-branch <branch>   Optional feature branch to merge into work branch"
+    echo "  --prefer-upstream           Prefer upstream on merge conflicts (git -X theirs)"
     echo "  --no-stash                  Do not stash uncommitted changes"
     echo "  --dry-run                   Print commands without executing"
     echo "  -h, --help                  Show this help"
@@ -80,6 +82,8 @@ while test (count $argv) -gt 0
             continue
         case --no-stash
             set use_stash 0
+        case --prefer-upstream
+            set prefer_upstream 1
         case --dry-run
             set SYNC_DRY_RUN 1
         case '*'
@@ -130,7 +134,11 @@ end
 if git merge-base --is-ancestor $mirror_branch HEAD
     echo "$work_branch already includes $mirror_branch"
 else
-    run_or_fail git merge --no-ff $mirror_branch -m "merge upstream $mirror_branch"
+    if test $prefer_upstream -eq 1
+        run_or_fail git merge --no-ff -X theirs $mirror_branch -m "merge upstream $mirror_branch (prefer upstream)"
+    else
+        run_or_fail git merge --no-ff $mirror_branch -m "merge upstream $mirror_branch"
+    end
 end
 
 if test -n "$feature_branch"
