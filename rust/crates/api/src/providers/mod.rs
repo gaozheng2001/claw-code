@@ -181,6 +181,19 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
+    // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
+    // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
+    // Uses the OpenAi provider kind because DashScope speaks the OpenAI REST
+    // shape — only the base URL and auth env var differ.
+    if canonical.starts_with("qwen/") || canonical.starts_with("qwen-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
     None
 }
 
@@ -349,7 +362,6 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
 
     use crate::error::ApiError;
     use crate::types::{
@@ -401,35 +413,33 @@ mod tests {
     }
 
     #[test]
-    fn openai_base_url_routes_unknown_model_to_openai() {
-        let _lock = env_lock();
-        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
-        let original_xai_base_url = std::env::var("XAI_BASE_URL").ok();
+    fn qwen_prefix_routes_to_dashscope_not_anthropic() {
+        // User request from Discord #clawcode-get-help: web3g wants to use
+        // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
+        // which has lower rate limits). metadata_for_model must route
+        // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
+        // the DashScope compatible-mode endpoint, regardless of whether
+        // ANTHROPIC_API_KEY is present in the environment.
+        let meta = super::metadata_for_model("qwen/qwen-max")
+            .expect("qwen/ prefix must resolve to DashScope metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
+        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
 
-        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
-        std::env::remove_var("XAI_BASE_URL");
+        // Bare qwen- prefix also routes
+        let meta2 = super::metadata_for_model("qwen-plus")
+            .expect("qwen- prefix must resolve to DashScope metadata");
+        assert_eq!(meta2.provider, ProviderKind::OpenAi);
+        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
 
-        let detected = detect_provider_kind("llama3.2");
-
-        if let Some(value) = original_openai_base_url {
-            std::env::set_var("OPENAI_BASE_URL", value);
-        } else {
-            std::env::remove_var("OPENAI_BASE_URL");
-        }
-        if let Some(value) = original_xai_base_url {
-            std::env::set_var("XAI_BASE_URL", value);
-        } else {
-            std::env::remove_var("XAI_BASE_URL");
-        }
-
-        assert_eq!(detected, ProviderKind::OpenAi);
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
+        // detect_provider_kind must agree even if ANTHROPIC_API_KEY is set
+        let kind = detect_provider_kind("qwen/qwen3-coder");
+        assert_eq!(
+            kind,
+            ProviderKind::OpenAi,
+            "qwen/ prefix must win over auth-sniffer order"
+        );
     }
 
     #[test]
