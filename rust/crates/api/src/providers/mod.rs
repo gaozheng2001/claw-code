@@ -189,6 +189,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    if has_non_empty_env_var("OPENAI_BASE_URL") {
+        return ProviderKind::OpenAi;
+    }
+    if has_non_empty_env_var("XAI_BASE_URL") {
+        return ProviderKind::Xai;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -199,6 +205,13 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
         return ProviderKind::Xai;
     }
     ProviderKind::Anthropic
+}
+
+fn has_non_empty_env_var(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 #[must_use]
@@ -336,6 +349,7 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
 
     use crate::error::ApiError;
     use crate::types::{
@@ -384,6 +398,38 @@ mod tests {
             .map(|m| m.provider)
             .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
         assert_eq!(kind2, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn openai_base_url_routes_unknown_model_to_openai() {
+        let _lock = env_lock();
+        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_xai_base_url = std::env::var("XAI_BASE_URL").ok();
+
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        std::env::remove_var("XAI_BASE_URL");
+
+        let detected = detect_provider_kind("llama3.2");
+
+        if let Some(value) = original_openai_base_url {
+            std::env::set_var("OPENAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("OPENAI_BASE_URL");
+        }
+        if let Some(value) = original_xai_base_url {
+            std::env::set_var("XAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("XAI_BASE_URL");
+        }
+
+        assert_eq!(detected, ProviderKind::OpenAi);
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
     }
 
     #[test]
