@@ -1,0 +1,76 @@
+name: Sync Upstream Fork
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repository in owner/name format
+        required: false
+        default: ultraworkers/claw-code
+      mirror_branch:
+        description: Upstream branch to mirror to origin
+        required: false
+        default: main
+      work_branch:
+        description: Branch that carries local customizations
+        required: false
+        default: my-main
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream and work branches
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo || 'ultraworkers/claw-code' }}
+          MIRROR_BRANCH: ${{ inputs.mirror_branch || 'main' }}
+          WORK_BRANCH: ${{ inputs.work_branch || 'my-main' }}
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          else
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          fi
+
+          git fetch upstream --prune
+          git fetch origin --prune
+
+          git checkout "${MIRROR_BRANCH}"
+          git merge --ff-only "upstream/${MIRROR_BRANCH}"
+          git push origin "${MIRROR_BRANCH}"
+
+          if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+            git checkout "${WORK_BRANCH}"
+          elif git ls-remote --exit-code --heads origin "${WORK_BRANCH}" >/dev/null 2>&1; then
+            git checkout -b "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
+          else
+            git checkout -b "${WORK_BRANCH}" "${MIRROR_BRANCH}"
+          fi
+
+          if git merge-base --is-ancestor "${MIRROR_BRANCH}" HEAD; then
+            echo "${WORK_BRANCH} already includes ${MIRROR_BRANCH}"
+          else
+            git merge --no-ff --no-edit "${MIRROR_BRANCH}"
+          fi
+
+          git push -u origin "${WORK_BRANCH}"
