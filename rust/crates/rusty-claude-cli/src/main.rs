@@ -26,8 +26,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -6348,9 +6349,15 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+// NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
+// now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
+// OpenAI, or DashScope at construction time based on
+// `detect_provider_kind(&model)`. The struct name is kept to avoid
+// churning `BuiltRuntime` and every Deref/DerefMut site that references
+// it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
+    client: ApiProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6370,15 +6377,48 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let client = match detect_provider_kind(&model) {
-            ProviderKind::Anthropic => ProviderClient::Anthropic(
-                AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                    .with_base_url(api::read_base_url()),
-            ),
-            ProviderKind::Xai | ProviderKind::OpenAi => ProviderClient::from_model(&model)?,
-        }
-        .with_prompt_cache(PromptCache::new(session_id));
-
+        // Dispatch to the correct provider at construction time.
+        // `ApiProviderClient` (exposed by the api crate as
+        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
+        // variants, where xAI and OpenAI both use the OpenAI-compat
+        // wire format under the hood. We consult
+        // `detect_provider_kind(&resolved_model)` so model-name prefix
+        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
+        // env-var presence.
+        //
+        // For Anthropic we build the client directly instead of going
+        // through `ApiProviderClient::from_model_with_anthropic_auth`
+        // so we can explicitly apply `api::read_base_url()` — that
+        // reads `ANTHROPIC_BASE_URL` and is required for the local
+        // mock-server test harness
+        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
+        // claw at its fake Anthropic endpoint. We also attach a
+        // session-scoped prompt cache on the Anthropic path; the
+        // prompt cache is Anthropic-only so non-Anthropic variants
+        // skip it.
+        let resolved_model = api::resolve_model_alias(&model);
+        let client = match detect_provider_kind(&resolved_model) {
+            ProviderKind::Anthropic => {
+                let auth = resolve_cli_auth_source()?;
+                let inner = AnthropicClient::from_auth(auth)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(session_id));
+                ApiProviderClient::Anthropic(inner)
+            }
+            ProviderKind::Xai | ProviderKind::OpenAi => {
+                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                // with `None` for the anthropic auth routes via
+                // `detect_provider_kind` and builds an
+                // `OpenAiCompatClient::from_env` with the matching
+                // `OpenAiCompatConfig` (openai / xai / dashscope).
+                // That reads the correct API-key env var and BASE_URL
+                // override internally, so this one call covers OpenAI,
+                // OpenRouter, xAI, DashScope, Ollama, and any other
+                // OpenAI-compat endpoint users configure via
+                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+            }
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -7411,7 +7451,12 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
+    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
+    // to the Anthropic variant and returns `None` for OpenAI-compat /
+    // xAI variants, which do not have a prompt cache. So this helper
+    // remains a no-op on non-Anthropic providers without any extra
+    // branching here.
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
