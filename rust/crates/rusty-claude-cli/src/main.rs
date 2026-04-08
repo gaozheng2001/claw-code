@@ -67,7 +67,12 @@ fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     }
 }
-const DEFAULT_DATE: &str = "2026-03-31";
+// Build-time constants injected by build.rs (fall back to static values when
+// build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
+const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
+    Some(d) => d,
+    None => "unknown",
+};
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
