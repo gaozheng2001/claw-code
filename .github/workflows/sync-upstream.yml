@@ -15,8 +15,13 @@ on:
         description: Branch that carries local customizations
         required: false
         default: my-main
-  schedule:
-    - cron: "23 3 * * *"
+  push:
+    branches:
+      - main
+      - my-main
+  repository_dispatch:
+    types:
+      - sync-upstream
 
 permissions:
   contents: write
@@ -27,6 +32,7 @@ concurrency:
 
 jobs:
   sync:
+    if: ${{ github.event_name != 'push' || github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +46,9 @@ jobs:
 
       - name: Sync upstream and work branches
         env:
-          UPSTREAM_REPO: ${{ inputs.upstream_repo || 'ultraworkers/claw-code' }}
-          MIRROR_BRANCH: ${{ inputs.mirror_branch || 'main' }}
-          WORK_BRANCH: ${{ inputs.work_branch || 'my-main' }}
+          UPSTREAM_REPO: ${{ github.event.client_payload.upstream_repo || github.event.inputs.upstream_repo || 'ultraworkers/claw-code' }}
+          MIRROR_BRANCH: ${{ github.event.client_payload.mirror_branch || github.event.inputs.mirror_branch || 'main' }}
+          WORK_BRANCH: ${{ github.event.client_payload.work_branch || github.event.inputs.work_branch || 'my-main' }}
         run: |
           set -euo pipefail
 
