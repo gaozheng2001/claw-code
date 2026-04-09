@@ -1125,6 +1125,35 @@ fn parse_sse_frame(
     if payload == "[DONE]" {
         return Ok(None);
     }
+    // Some backends embed an error object in a data: frame instead of using an
+    // HTTP error status. Surface the error message directly rather than letting
+    // ChatCompletionChunk deserialization fail with a cryptic 'missing field' error.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.to_string(),
+                retryable: false,
+            });
+        }
+    }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
         .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
