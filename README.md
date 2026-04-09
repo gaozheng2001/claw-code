@@ -45,21 +45,30 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 
 ## Quick start
 
+> [!NOTE]
+> **`cargo install clawcode` will not work** — this package is not published on crates.io. Build from source as shown below.
+
 ```bash
-cd rust
+# 1. Clone and build
+git clone https://github.com/ultraworkers/claw-code
+cd claw-code/rust
 cargo build --workspace
-./target/debug/claw --help
-./target/debug/claw prompt "summarize this repository"
-```
 
-Authenticate with either an API key or the built-in OAuth flow:
-
-```bash
+# 2. Set your API key (Anthropic API key — not a Claude subscription)
 export ANTHROPIC_API_KEY="sk-ant-..."
-# or
-cd rust
-./target/debug/claw login
+
+# 3. Verify everything is wired correctly
+./target/debug/claw doctor
+
+# 4. Run a prompt
+./target/debug/claw prompt "say hello"
 ```
+
+> [!NOTE]
+> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+
+> [!NOTE]
+> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
 Run the workspace test suite:
 

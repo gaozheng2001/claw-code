@@ -163,6 +163,35 @@ impl OpenAiCompatClient {
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
+        // Some backends return {"error":{"message":"...","type":"...","code":...}}
+        // instead of a valid completion object. Check for this before attempting
+        // full deserialization so the user sees the actual error, not a cryptic
+        // "missing field 'id'" parse failure.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c as u16);
+                return Err(ApiError::Api {
+                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id,
+                    body,
+                    retryable: false,
+                });
+            }
+        }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
             ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
         })?;
@@ -281,6 +310,19 @@ fn allows_missing_api_key_for_base_url(config: OpenAiCompatConfig, base_url: &st
 static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
+/// the same as a missing field (i.e. as an empty vector).
+/// Some OpenAI-compatible providers emit `"tool_calls": null` instead of
+/// omitting the field or using `[]`, which serde's `#[serde(default)]` alone
+/// does not tolerate — `default` only handles absent keys, not null values.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// from multiple concurrent clients. Entropy is drawn from the nanosecond
 /// wall clock mixed with a monotonic counter and run through a splitmix64
 /// finalizer; adequate for retry jitter (no cryptographic requirement).
@@ -699,7 +741,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
 
@@ -763,6 +805,24 @@ fn normalize_model_for_provider(model: &str, config: OpenAiCompatConfig) -> Stri
             .split_once('/')
             .map_or_else(|| trimmed.to_string(), |(_, name)| name.to_string()),
         _ => trimmed.to_string(),
+        }
+    }
+
+/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+/// The prefix is used only to select transport; the backend expects the
+/// bare model id.
+fn strip_routing_prefix(model: &str) -> &str {
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix before "/" is a known routing prefix,
+        // not if "/" appears in the middle of the model name for other reasons.
+        if matches!(prefix, "openai" | "xai" | "grok" | "qwen") {
+            &model[pos + 1..]
+        } else {
+            model
+        }
+    } else {
+        model
     }
 }
 
@@ -779,9 +839,21 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
         messages.extend(translate_message(message));
     }
 
-    let mut payload = json!({
-        "model": model,
-        "max_tokens": request.max_tokens,
+    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+    let wire_model = strip_routing_prefix(&request.model);
+
+    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+    // We send the correct field based on the wire model name so gpt-5.x requests
+    // don't fail with "unknown field max_tokens".
+    let max_tokens_key = if wire_model.starts_with("gpt-5") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+
+        let mut payload = json!({
+        "model": wire_model,
+        max_tokens_key: request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
@@ -821,6 +893,10 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             payload["stop"] = json!(stop);
         }
     }
+    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning_effort"] = json!(effort);
+    }
 
     payload
 }
@@ -847,11 +923,16 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                });
+                // Only include tool_calls when non-empty: some providers reject
+                // assistant messages with an explicit empty tool_calls array.
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -889,13 +970,45 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .join("\n")
 }
 
+/// Recursively ensure every object-type node in a JSON Schema has
+/// `"properties"` (at least `{}`) and `"additionalProperties": false`.
+/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// objects that omit these fields; `/chat/completions` is lenient but also
+/// accepts them, so we normalise unconditionally.
+fn normalize_object_schema(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("object") {
+            obj.entry("properties").or_insert_with(|| json!({}));
+            obj.entry("additionalProperties")
+                .or_insert(Value::Bool(false));
+        }
+        // Recurse into properties values
+        if let Some(props) = obj.get_mut("properties") {
+            if let Some(props_obj) = props.as_object_mut() {
+                let keys: Vec<String> = props_obj.keys().cloned().collect();
+                for k in keys {
+                    if let Some(v) = props_obj.get_mut(&k) {
+                        normalize_object_schema(v);
+                    }
+                }
+            }
+        }
+        // Recurse into items (arrays)
+        if let Some(items) = obj.get_mut("items") {
+            normalize_object_schema(items);
+        }
+    }
+}
+
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
     json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": parameters,
         }
     })
 }
@@ -1165,6 +1278,76 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
+        // OpenAI /responses endpoint rejects object schemas missing
+        // "properties" and "additionalProperties". Verify normalize_object_schema
+        // fills them in so the request shape is strict-validator-safe.
+        use super::normalize_object_schema;
+
+        // Bare object — no properties at all
+        let mut schema = json!({"type": "object"});
+        normalize_object_schema(&mut schema);
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+
+        // Nested object inside properties
+        let mut schema2 = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "object", "properties": {"lat": {"type": "number"}}}
+            }
+        });
+        normalize_object_schema(&mut schema2);
+        assert_eq!(schema2["additionalProperties"], json!(false));
+        assert_eq!(
+            schema2["properties"]["location"]["additionalProperties"],
+            json!(false)
+        );
+
+        // Existing properties/additionalProperties should not be overwritten
+        let mut schema3 = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": true
+        });
+        normalize_object_schema(&mut schema3);
+        assert_eq!(
+            schema3["additionalProperties"],
+            json!(true),
+            "must not overwrite existing"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_included_when_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("think hard")],
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn reasoning_effort_omitted_when_not_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn openai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -1384,6 +1567,7 @@ mod tests {
             frequency_penalty: Some(0.5),
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
+            reasoning_effort: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -1467,5 +1651,142 @@ mod tests {
         assert!(payload.get("frequency_penalty").is_none());
         assert!(payload.get("presence_penalty").is_none());
         assert!(payload.get("stop").is_none());
+    }
+
+    #[test]
+    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
+        // gpt-5* models require `max_completion_tokens`; legacy `max_tokens` causes
+        // a request-validation failure. Verify the correct key is emitted.
+        let request = MessageRequest {
+            model: "gpt-5.2".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["max_completion_tokens"],
+            json!(512),
+            "gpt-5.2 should emit max_completion_tokens"
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "gpt-5.2 must not emit max_tokens"
+        );
+    }
+
+    /// Regression test: some OpenAI-compatible providers emit `"tool_calls": null`
+    /// in stream delta chunks instead of omitting the field or using `[]`.
+    /// Before the fix this produced: `invalid type: null, expected a sequence`.
+    #[test]
+    fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
+        let json = r#"{
+            "content": "",
+            "function_call": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+        }"#;
+
+        use super::deserialize_null_as_empty_vec;
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+        let delta: Delta = serde_json::from_str(json)
+            .expect("delta with tool_calls:null must deserialize without error");
+        assert!(
+            delta.tool_calls.is_empty(),
+            "tool_calls:null must produce an empty vec, not an error"
+        );
+    }
+
+    #[test]
+    /// Regression: when building a multi-turn request where a prior assistant
+    /// turn has no tool calls, the serialized assistant message must NOT include
+    /// `tool_calls: []`. Some providers reject requests that carry an empty
+    /// tool_calls array on assistant turns (gaebal-gajae repro 2026-04-09).
+    #[test]
+    fn assistant_message_without_tool_calls_omits_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert!(
+            assistant_msg.get("tool_calls").is_none(),
+            "assistant message without tool calls must omit tool_calls field: {:?}",
+            assistant_msg
+        );
+    }
+
+    /// Regression: assistant messages WITH tool calls must still include
+    /// the tool_calls array (normal multi-turn tool-use flow).
+    #[test]
+    fn assistant_message_with_tool_calls_includes_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        let tool_calls = assistant_msg
+            .get("tool_calls")
+            .expect("assistant message with tool calls must include tool_calls field");
+        assert!(tool_calls.is_array());
+        assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn non_gpt5_uses_max_tokens() {
+        // Older OpenAI models expect `max_tokens`; verify gpt-4o is unaffected.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["max_tokens"], json!(512));
+        assert!(
+            payload.get("max_completion_tokens").is_none(),
+            "gpt-4o must not emit max_completion_tokens"
+        );
     }
 }
