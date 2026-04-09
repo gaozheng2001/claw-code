@@ -3732,6 +3732,10 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                let final_text = final_assistant_text(&summary);
+                if !final_text.is_empty() && !final_text.ends_with('\n') {
+                    writeln!(stdout)?;
+                }
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),

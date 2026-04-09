@@ -237,18 +237,7 @@ impl Default for TerminalRenderer {
 }
 
 impl TerminalRenderer {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn color_theme(&self) -> &ColorTheme {
-        &self.color_theme
-    }
-
-    #[must_use]
-    pub fn render_markdown(&self, markdown: &str) -> String {
+    fn render_markdown_internal(&self, markdown: &str, trim_trailing: bool) -> String {
         let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
         let mut state = RenderState::default();
@@ -267,7 +256,26 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        if trim_trailing {
+            output.trim_end().to_string()
+        } else {
+            output
+        }
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn color_theme(&self) -> &ColorTheme {
+        &self.color_theme
+    }
+
+    #[must_use]
+    pub fn render_markdown(&self, markdown: &str) -> String {
+        self.render_markdown_internal(markdown, true)
     }
 
     #[must_use]
@@ -609,7 +617,7 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        Some(renderer.render_markdown_internal(&ready, false))
     }
 
     #[must_use]
@@ -619,7 +627,7 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            Some(renderer.render_markdown_internal(&pending, false))
         }
     }
 }
@@ -990,6 +998,24 @@ mod tests {
             .push(&renderer, "```\n")
             .expect("closed code fence flushes");
         assert!(strip_ansi(&code).contains("fn main()"));
+        assert!(strip_ansi(&code).ends_with("\n\n"));
+    }
+
+    #[test]
+    fn streaming_state_preserves_line_break_between_code_block_and_following_text() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        let code = state
+            .push(&renderer, "```text\nline\n```\n")
+            .expect("code block chunk should flush");
+        let follow = state
+            .push(&renderer, "next paragraph\n\n")
+            .expect("paragraph chunk should flush");
+
+        let combined = format!("{code}{follow}");
+        let plain = strip_ansi(&combined);
+        assert!(plain.contains("╰─\n\nnext paragraph"));
     }
 
     #[test]
