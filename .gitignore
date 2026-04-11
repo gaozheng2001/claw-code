@@ -9,3 +9,4 @@ archive/
 # Local editor settings
 .vscode/
 .claw/
+.sandbox-home/
