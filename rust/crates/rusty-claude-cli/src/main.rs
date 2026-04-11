@@ -7207,6 +7207,7 @@ impl AnthropicRuntimeClient {
         if events
             .iter()
             .any(|event| matches!(event, AssistantEvent::MessageStop))
+            && has_assistant_content(&events)
         {
             return Ok(events);
         }
@@ -7223,6 +7224,11 @@ impl AnthropicRuntimeClient {
             })?;
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
+        if !has_assistant_content(&events) {
+            return Err(RuntimeError::new(
+                "assistant returned an empty response after stream and fallback completion; provider likely dropped malformed tool-call output",
+            ));
+        }
         Ok(events)
     }
 }
@@ -7234,6 +7240,13 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .messages
         .last()
         .is_some_and(|message| message.role == MessageRole::Tool)
+}
+
+fn has_assistant_content(events: &[AssistantEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+            || matches!(event, AssistantEvent::ToolUse { .. })
+    })
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -8497,6 +8510,7 @@ mod tests {
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
+        has_assistant_content,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
@@ -8599,6 +8613,35 @@ mod tests {
         assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
         assert!(rendered.contains("session session-issue-22"));
         assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn has_assistant_content_detects_text_and_tool_blocks() {
+        let with_text = vec![
+            AssistantEvent::Usage(runtime::TokenUsage::default()),
+            AssistantEvent::TextDelta("hello".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        assert!(has_assistant_content(&with_text));
+
+        let with_tool = vec![
+            AssistantEvent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Bash".to_string(),
+                input: "{}".to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ];
+        assert!(has_assistant_content(&with_tool));
+    }
+
+    #[test]
+    fn has_assistant_content_ignores_usage_only_events() {
+        let events = vec![
+            AssistantEvent::Usage(runtime::TokenUsage::default()),
+            AssistantEvent::MessageStop,
+        ];
+        assert!(!has_assistant_content(&events));
     }
 
     #[test]
