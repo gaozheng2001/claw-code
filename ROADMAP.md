@@ -3255,3 +3255,83 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. The choice (implement vs remove) is the only architectural decision. Runtime has enough scaffolding that implementing is ~60 lines. Removing is ~3 lines.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdHH` on main HEAD `b2366d1` in response to Clawhip pinpoint nudge at `1494872623782301817`. Joins **silent-flag / documented-but-unenforced** (#96–#101, #104, #108) on the command-dispatch-semantics axis — eighth instance of "documented behavior differs from actual." Joins **unplumbed-subsystem / CLI-advertised-but-unreachable** (#78, #96, #100, #102, #103, #107, #109) as the eighth surface where the spec advertises a capability the implementation doesn't deliver. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110) — `/providers` silently returns doctor output under the wrong kind label; help lies about capability. Natural bundle: **#78 + #96 + #111** — three-way "declared but not implemented as declared" triangle (CLI route never constructed + help resume-safe leaks stubs + slash command dispatches to wrong handler). Also **#96 + #108 + #111** — full `--help`/dispatch surface hygiene quartet covering help-filter-leaks + subcommand typo fallthrough + slash-command mis-dispatch. Session tally: ROADMAP #111.
+
+112. **Concurrent claw invocations that touch the same session file (e.g. two `/clear --confirm` or two `/compact` calls on the same session-id race) fail intermittently with a raw OS errno — `{"type":"error","error":"No such file or directory (os error 2)"}` — instead of a domain-specific concurrent-modification error. There is no file locking, no read-modify-write protection, no rename-race guard. The loser of the race gets ENOENT because the winner rotated, renamed, or deleted the session file between the loser's `fs::read_to_string` and its own `fs::write`. A claw orchestrating multiple lanes that happen to share a session id (because the operator reuses one, or because a CI matrix is re-running with the same state) gets unpredictable partial failures with un-actionable raw-io errors** — dogfooded 2026-04-18 on main HEAD `a049bd2` from `/tmp/cdII`. Five concurrent `/compact` calls on the same session: 4 succeed, 1 fails with `os error 2`. Two concurrent `/clear --confirm` calls: same pattern.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdII && git init -q .
+     $ # ... set up a minimal session at .claw/sessions/<bucket>/s.jsonl ...
+
+     # Race 5 concurrent /compact calls:
+     $ for i in 1 2 3 4 5; do
+     >   claw --resume s --output-format json /compact >/tmp/c$i.log 2>&1 &
+     > done
+     $ wait
+     $ for i in 1 2 3 4 5; do echo "$i: $(head -c 80 /tmp/c$i.log)"; done
+     1: { ... successful compact
+     2: {"command":"/compact","error":"No such file or directory (os error 2)","type":"error"}
+     3: { ... successful compact
+     4: { ... successful compact
+     5: { ... successful compact
+     # 4 succeed, 1 races and gets raw ENOENT
+
+     # Same with /clear:
+     $ claw --resume s --output-format json /clear --confirm >/tmp/r1.log 2>&1 &
+     $ claw --resume s --output-format json /clear --confirm >/tmp/r2.log 2>&1 &
+     $ wait; cat /tmp/r1.log /tmp/r2.log
+     {"kind":"clear","backup":"...",...}
+     {"command":"/clear --confirm","error":"No such file or directory (os error 2)","type":"error"}
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/session.rs:204-212` — `save_to_path`:
+       ```rust
+       pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
+           let path = path.as_ref();
+           let snapshot = self.render_jsonl_snapshot()?;
+           rotate_session_file_if_needed(path)?;       // may rename path → path.rot-{ts}
+           write_atomic(path, &snapshot)?;              // writes tmp, renames tmp → path
+           cleanup_rotated_logs(path)?;                 // deletes older rot files
+           Ok(())
+       }
+       ```
+       Three steps: rotate (rename) + write_atomic (tmp + rename) + cleanup (deletes). No lock around the sequence.
+     - `rust/crates/runtime/src/session.rs:1063-1071` — `write_atomic` creates `temp_path` = `{path}.tmp-{ts}-{counter}`, writes, renames to `path`. Atomic *per rename* but not *per multi-step sequence*. A concurrent `rotate_session_file_if_needed` between another process's read and write races here.
+     - `rust/crates/runtime/src/session.rs:1085-1094` — `rotate_session_file_if_needed`:
+       ```rust
+       let Ok(metadata) = fs::metadata(path) else {
+           return Ok(());
+       };
+       if metadata.len() < ROTATE_AFTER_BYTES {
+           return Ok(());
+       }
+       let rotated_path = rotated_log_path(path);
+       fs::rename(path, rotated_path)?;  // race window: another process read-holding `path`
+       Ok(())
+       ```
+       Classic TOCTOU: `metadata()` then `rename()` with no guard.
+     - `rust/crates/runtime/src/session.rs:1105-1140` — `cleanup_rotated_logs` deletes `.rot-{ts}` files older than the 3 most recent. Another process reading a rot file can race against the deletion.
+     - `rust/crates/runtime/src/session.rs` — no `fcntl`, no `flock`, no advisory lock file. `grep -rn 'flock\|FileLock\|advisory' rust/crates/runtime/src/session.rs` returns zero matches.
+     - `rust/crates/rusty-claude-cli/src/main.rs` error formatter (`main.rs:2222-2232` / equivalent) catches the SessionError and formats via `to_string()`, which for `SessionError::Io(...)` just emits the underlying io::Error `Display` — which is `"No such file or directory (os error 2)"`. No domain translation to "session file was concurrently modified; retry" or similar.
+
+     **Why this is specifically a clawability gap.**
+     1. *Un-actionable error.* `"No such file or directory (os error 2)"` tells the claw nothing about what to do. A claw's error handler cannot distinguish "session file doesn't exist" (pre-session) from "session file race-disappeared" (concurrent write) from "session file was deleted out-of-band" (housekeeping) — all three surface with the same ENOENT message.
+     2. *Not inherently a bug if sessions are single-writer* — but the per-workspace-bucket scoping at `session_control.rs:31-32` assumes one claw per workspace. The moment two claws spawn in the same workspace (e.g., ulw-loop with parallel lanes, CI runners, multi-turn orchestration), they race.
+     3. *Session rotation amplifies the race.* `ROTATE_AFTER_BYTES = 256 * 1024`. A session growing past 256KB triggers rotation on next `save_to_path`. If two processes call `save_to_path` around the rotation boundary, one renames the file, the other's subsequent read fails.
+     4. *No advisory lock file.* Unix-standard `.claw/sessions/<bucket>/s.jsonl.lock` (exclusive flock) would serialize save_to_path operations with minimal overhead. The machinery exists in the ecosystem; claw-code doesn't use it.
+     5. *Error-to-diagnostic mapping incomplete.* `SessionError::Io(...)` has a Display impl that just forwards the os::Error message. A domain-aware translation layer would convert common concurrent-access failures into actionable "retry-safe" / "session-modified-externally" categories.
+     6. *Joins truth-audit cluster on error-quality axis.* The session file WAS modified (it was deleted-then-recreated by process 1), but the error says "No such file or directory" — not "the file you were trying to save was deleted or rotated during your save." The error lies by omission about what actually happened.
+
+     **Fix shape — advisory locking + domain-specific error classes + retry guidance.**
+     1. *Add an advisory lock file.* `.claw/sessions/<bucket>/<session>.jsonl.lock`. Take an exclusive `flock` (via `fs2` crate or libc `fcntl`) for the duration of `save_to_path`. ~30 lines. Covers rotation + write + cleanup as an atomic sequence from other claw-code processes' perspective.
+     2. *Introduce domain-specific error variants.* `SessionError::ConcurrentModification { path, operation }` when a `fs::rename` source path vanishes between metadata check and rename. `SessionError::SessionFileVanished { path }` when `fs::read_to_string` returns ENOENT after a successful session-existence check. ~25 lines.
+     3. *Map errors at the JSON envelope.* When the CLI catches `SessionError::ConcurrentModification`, emit `{"type":"error","error_kind":"concurrent_modification","message":"..","retry_safe":true}` instead of a raw io-error string. ~20 lines.
+     4. *Retry policy for idempotent operations.* `/compact` and `/clear` that fail with `ConcurrentModification` are safe to retry — emit a structured retry hint. `/export` that fails at write time is not safe to retry without clobbering — explicit `retry_safe: false`. ~15 lines.
+     5. *Regression test.* Spawn 10 concurrent `/compact` processes on a single session file. Assert: all succeed, OR any failures are structured `ConcurrentModification` errors (no raw `os error 2`). Use `tempfile` + `rayon` or tokio join_all. ~50 lines of test harness.
+
+     **Acceptance.** `for i in 1..5; do claw --resume s /compact & done; wait` produces either all successes or structured `{"error_kind":"concurrent_modification","retry_safe":true,...}` errors — never a raw `"No such file or directory (os error 2)"`. Advisory lock serializes save_to_path. Domain errors are actionable by claw orchestrators.
+
+     **Blocker.** None. Advisory locking is a well-worn pattern; `fs2` crate is already in the Rust ecosystem. Domain error mapping is additive. The architectural decision is whether to serialize at the save boundary (simpler, some perf cost) or implement a full MVCC-style session store (far more work, out of scope).
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdII` on main HEAD `a049bd2` in response to Clawhip pinpoint nudge at `1494880177099116586`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110) — the error message lies about what actually happened (file vanished via concurrent rename, not intrinsic absence). Joins **Session handling** as a new micro-cluster (only existing member was #93 — reference-resolution semantics). Natural bundle: **#93 + #112** — session semantic correctness (reference resolution + concurrent-modification error clarity). Adjacent to **#104** (two-paths-diverge export) on the session-file-handling axis: #104 says the two export paths disagree on filename; #112 says concurrent session-file writers race with no advisory lock. Together session-handling has filename-semantic + concurrency gaps that the test suite should cover. Session tally: ROADMAP #112.
