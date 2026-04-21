@@ -4815,7 +4815,19 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-20 against `/tmp/claw-dogfood` (env-cleaned, no git, no config) on main HEAD `7370546` in response to Clawhip pinpoint nudge at `1495620050424434758`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123, #124, #126) as 18th — `--json` silently swallowed into Prompt dispatch instead of being recognized or rejected. Joins **Parser-level trust gap quintet** (#108, #117, #119, #122, **#127**) as 5th — same `_other => Prompt` fall-through arm, fifth distinct entry case (#108 = typoed verb, #117 = `-p` greedy, #119 = bare slash + arg, #122 = `--base-commit` greedy, **#127 = valid verb + unrecognized suffix arg**). Joins **Cred-error misdirection / failure-classification gaps** as a sibling of #99 (system-prompt unvalidated) — same family of "local diagnostic verb pretends to need API creds." Joins **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125) — `claw --help` lies about per-verb accepted flags. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123, #124) as 11th — three working forms and one broken form for the same logical intent (`--json` doctor output). Joins **Claude Code migration parity** (#103, #109, #116) as 4th — Claude Code's `--json` convention shorthand is unrecognized in claw-code's verb-suffix position; users migrating get cred errors instead. Cross-cluster with **README/USAGE doc-vs-implementation gap** — README explicitly recommends `claw doctor` as the first health check; the natural JSON form of that exact command is broken. Natural bundle: **#108 + #117 + #119 + #122 + #127** — parser-level trust gap quintet: complete `_other => Prompt` fall-through audit (typoed verb + greedy `-p` + bare slash-verb + greedy `--base-commit` + valid verb + unrecognized suffix). Also **#99 + #127** — local-diagnostic cred-error misdirection pair: `system-prompt` and verb-suffix `--json` both pretend to need creds for pure-local operations. Also **#126 + #127** — diagnostic-verb surface integrity pair: `/config` section args ignored (#126) + verb-suffix args silently mis-dispatched (#127). Session tally: ROADMAP #127.
 
-128. **`claw --model <malformed>` (spaces, empty string, special chars, invalid provider/model syntax) silently falls through to API-layer cred error instead of rejecting at parse time** — dogfooded 2026-04-20 on main HEAD `d284ef7` from a fresh environment (no config, no auth). The `--model` flag accepts any string without syntactic validation: spaces (`claw --model "bad model"`), empty strings (`claw --model ""`), special characters (`claw --model "@invalid"`), non-existent provider/model combinations all parse successfully. The malformed model string then flows into the runtime's provider-detection layer, which silently accepts it as Anthropic fallback or passes it to an API layer that fails with `missing Anthropic credentials` (misdirection) rather than a clear "invalid model syntax" error at parse time. With API credentials configured, a malformed model string gets sent to the API, billing tokens against a request that should have failed client-side.
+128. **[CLOSED 2026-04-21]** **`claw --model <malformed>` (spaces, empty string, special chars, invalid provider/model syntax) silently falls through to API-layer cred error instead of rejecting at parse time** — dogfooded 2026-04-20 on main HEAD `d284ef7` from a fresh environment (no config, no auth). The `--model` flag accepts any string without syntactic validation: spaces (`claw --model "bad model"`), empty strings (`claw --model ""`), special characters (`claw --model "@invalid"`), non-existent provider/model combinations all parse successfully. The malformed model string then flows into the runtime's provider-detection layer, which silently accepts it as Anthropic fallback or passes it to an API layer that fails with `missing Anthropic credentials` (misdirection) rather than a clear "invalid model syntax" error at parse time. With API credentials configured, a malformed model string gets sent to the API, billing tokens against a request that should have failed client-side.
+
+     **Closure (2026-04-21):** Re-verified on main HEAD `4cb8fa0`. All cases now rejected at parse time:
+     ```
+     $ claw --model '' status           → error: model string cannot be empty
+     $ claw --model 'bad model' status  → error: invalid model syntax: 'bad model' contains spaces
+     $ claw --model 'sonet' status      → error: invalid model syntax: 'sonet'. Expected provider/model ...
+     $ claw --model '@invalid' status   → error: invalid model syntax: '@invalid'. Expected provider/model ...
+     $ claw --model 'totally-not-real-xyz' status → error: invalid model syntax ...
+     $ claw --model sonnet status       → ok, resolves to claude-sonnet-4-6
+     $ claw --model anthropic/claude-opus-4-6 status → ok, passes through
+     ```
+     Validation happens in `validate_model_syntax()` before `resolve_model_alias_with_config()`. All `--model` and `--model=` parse paths call it. No API call ever reached with malformed input. Residual gap (model provenance in status JSON — raw input vs resolved value) was split off as #148 (see below).
 
 129. **MCP server startup blocks credential validation — `claw <prompt>` with any `.claw.json` `mcpServers` entry awaits the MCP server's stdio handshake BEFORE checking whether the operator has Anthropic credentials. With no `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` set and `mcpServers.everything = { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] }` configured, the CLI hangs forever (verified via `timeout 30s` — still in MCP startup at 30s with three repeated `"Starting default (STDIO) server..."` lines), instead of fail-fasting with the same `missing Anthropic credentials` error that fires in milliseconds when no MCP is configured. A misconfigured-but-running MCP server (one that spawns successfully but never completes its `initialize` handshake) wedges every `claw <prompt>` invocation permanently. A misconfigured MCP server with a slow-but-eventually-succeeding init (npx download, container pull, network roundtrip) burns startup latency on every Prompt invocation regardless of whether the LLM call would even succeed. This is the runtime-side companion to #102's config-time MCP diagnostic gap: #102 says doctor doesn't surface MCP reachability; #129 says the Prompt path's reachability check is implicit, blocking, retried, and runs *before* the cheaper auth precondition that should run first** — dogfooded 2026-04-20 on main HEAD `d284ef7` from `/tmp/claw-mcp-test` with `env -i PATH=$PATH HOME=$HOME` (all auth env vars unset).
 
@@ -5665,3 +5677,46 @@ With valid credentials, the empty string would be sent to Claude as a user promp
 **Blocker.** None. 5-line change in `parse_subcommand()`.
 
 **Source.** Jobdori dogfood 2026-04-21 20:32 KST on main HEAD `f877aca` in response to Clawhip nudge. Joins **prompt misdelivery** cluster (#145 sibling). Session tally: ROADMAP #147.
+
+## Pinpoint #148. `claw status` JSON shows resolved model but not raw input or source — post-hoc "why did my --model flag behave this way?" requires re-reading argv
+
+**Gap.** After #128 closed (malformed model strings now rejected at parse time), the residual provenance gap from the original #124 pinpoint remains: `claw status --output-format json` surfaces only the resolved model string. No trace of whether the user passed `--model sonnet` (alias → resolved), `--model anthropic/claude-opus-4-6` (pass-through), or relied on env/config default. A claw debugging "which model actually runs if I invoke this?" has to inspect argv instead of reading a structured field.
+
+**Verified on main HEAD `4cb8fa0` (2026-04-21 20:40 KST):**
+
+```
+$ claw --model sonnet --output-format json status | jq '{model}'
+{"model": "claude-sonnet-4-6"}
+
+$ claw --model anthropic/claude-opus-4-6 --output-format json status | jq '{model}'
+{"model": "anthropic/claude-opus-4-6"}
+
+# Same resolved value can come from three different sources;
+# JSON envelope gives no way to distinguish.
+```
+
+**Why this is a clawability gap.**
+1. **Loss of origin information**: alias resolution collapses `sonnet` and `claude-sonnet-4-6` and `{"aliases":{"x":"claude-sonnet-4-6"}}` + `--model x` into one string. Debug forensics has to read argv.
+2. **Clawhip orchestration**: a clawhip dispatcher sending `--model` wants to confirm its flag was honored, not that the default kicked in (#105 model-resolution-source disagreement is adjacent).
+3. **Truth-audit / diagnostic-integrity**: the status envelope is supposed to be the single source of truth for "what would this process run as". Missing provenance weakens the contract.
+
+**Fix shape (~50 lines).** Add two fields to status JSON:
+- `model_source`: `"flag" | "env" | "config" | "default"` — where the model string came from.
+- `model_raw`: the user's original input (pre-alias-resolution). Null when source is `default`.
+
+Text mode appends a line: `Model source     flag (raw: sonnet)` or `Model source     default`.
+
+Threading: parser already knows the source (it's the arm that sets `model`). Propagate `(model, model_raw, model_source)` tuple through `CliAction::Status` and into `StatusContext`. Env/default resolution paths are in `resolve_repl_model*` helpers.
+
+**Acceptance.**
+- `claw --model sonnet --output-format json status` → `model: "claude-sonnet-4-6"`, `model_raw: "sonnet"`, `model_source: "flag"`.
+- `claw --model anthropic/claude-opus-4-6 --output-format json status` → `model_raw: "anthropic/claude-opus-4-6"`, `model_source: "flag"`.
+- `claw --output-format json status` (no flag) → `model_raw: null`, `model_source: "default"` (or `"env"` if `ANTHROPIC_MODEL` set; or `"config"` if `.claw.json` set `model`).
+- Text mode shows same provenance.
+- Regression test: parse_args + status_json_value roundtrip asserts each source value.
+
+**Blocker.** None. All resolution sites already exist; only plumbing + one serialization addition.
+
+**Not a regression of #128.** #128 was about rejecting malformed strings (now closed). #148 is about labeling the valid ones after resolution.
+
+**Source.** Jobdori dogfood 2026-04-21 20:40 KST on main HEAD `4cb8fa0` in response to Q's bundle hint. Split from historical #124 residual. Joins **truth-audit / diagnostic-integrity** cluster. Session tally: ROADMAP #148.
